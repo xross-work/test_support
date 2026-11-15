@@ -6,18 +6,27 @@ Pyxsim pytest framework
 This module provides functions to run tests for XMOS applications and
 libraries.
 """
+import importlib
+import math
 import multiprocessing
 import os
 import re
 import sys
 import subprocess
+import warnings
 from pathlib import Path
 
 from Pyxsim.xmostest_subprocess import call_get_output
-from . import pyxsim
 from Pyxsim.xe import Xe
-from Pyxsim.pyxsim import Xsi
-from Pyxsim.pyxsim import XsiRemote
+
+
+def __getattr__(name):
+    # The output checkers and bus models are usable without XTC Tools, so load
+    # the XSI library only when the simulator is asked for.
+    if name in ("pyxsim", "Xsi", "XsiRemote"):
+        module = importlib.import_module("Pyxsim.pyxsim")
+        return module if name == "pyxsim" else getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # This function is called automatically by the runners
@@ -100,6 +109,52 @@ def _build(
     return (success, output)
 
 
+class BuildError(Exception):
+    """build() could not build the executable; the message includes the build output."""
+
+
+def build(xe, *, build_dir=None, timeout=600):
+    """Build the one target that produces ``xe`` in an already-configured CMake build.
+
+    Call it before run(), or before Pyxrun.run(), when a test must build on demand:
+    one configuration out of many, or an application whose generated header the
+    test has just rewritten. It does not configure, so the variants themselves are
+    declared in CMakeLists.txt. The target is the executable's name without ``.xe``,
+    as XCommon CMake names it.
+
+    ``build_dir`` defaults to the nearest ``build`` directory above the executable
+    that holds a CMake cache; pass it for any other layout. Raises BuildError if
+    there is no such directory, or the build fails or exceeds ``timeout`` seconds.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    xe = Path(xe).resolve()
+    if build_dir is None:
+        for parent in xe.parents:
+            if (parent / "build" / "CMakeCache.txt").is_file():
+                build_dir = parent / "build"
+                break
+        else:
+            raise BuildError(f"No configured CMake build directory found above {xe}; "
+                             "run cmake first or pass build_dir")
+    build_dir = Path(build_dir).resolve()
+    if not (build_dir / "CMakeCache.txt").is_file():
+        raise BuildError(f"{build_dir} is not a configured CMake build directory; run cmake first")
+    command = ["cmake", "--build", str(build_dir), "--target", xe.stem]
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        raise BuildError(f"Building {xe.stem} exceeded {timeout} seconds\n{output}") from None
+    if result.returncode != 0:
+        raise BuildError(f"Building {xe.stem} failed with status {result.returncode}\n{result.stdout}")
+    if not xe.is_file():
+        raise BuildError(f"Building {xe.stem} succeeded but did not produce {xe}\n{result.stdout}")
+
+
 def _split_capture_lines(text):
     return [x.strip() for x in text.split("\n") if x != ""]
 
@@ -133,7 +188,45 @@ def _replay_captured_output(capfd, tester, verbosity):
     return output
 
 
+def run(xe, tester=None, simthreads=None, *, timeout=600, capfd=None, **kwargs):
+    """Run an already-built executable without invoking the build system.
+
+    Like Pyxrun.run(), return a boolean for execution/comparison success;
+    assertion-based checkers still raise on mismatch. A tester requires pytest's
+    capfd fixture so its comparison cannot be silently skipped. Simulator options
+    (simargs, appargs, plugins, etc.) pass through to the existing simulator runner.
+
+    run() does not build. run_on_simulator() remains the way to build and then
+    run; it and the deprecated run_on_simulator_() keep their existing behaviour,
+    including their checker return values.
+    """
+    if kwargs.pop("do_xe_prebuild", False):
+        raise ValueError("run() does not build; build the executable before calling run()")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    if tester is not None:
+        if not callable(getattr(tester, "run", None)):
+            raise TypeError("tester must have a callable run(lines) method")
+        if capfd is None:
+            raise ValueError("capfd is required when run() is given a tester")
+    result = _run_on_simulator(
+        xe, tester=tester, simthreads=[] if simthreads is None else simthreads,
+        timeout=timeout, capfd=capfd, **kwargs,
+    )
+    return True if result is None else bool(result)
+
+
 def run_on_simulator_(xe, tester=None, simthreads=[], **kwargs):
+    """Deprecated: use run() for an already-built executable.
+
+    Preserves the legacy checker return value and optional build arguments.
+    """
+    warnings.warn("Pyxsim.run_on_simulator_() is deprecated; use Pyxsim.run()",
+                  DeprecationWarning, stacklevel=2)
+    return _run_on_simulator(xe, tester=tester, simthreads=simthreads, **kwargs)
+
+
+def _run_on_simulator(xe, tester=None, simthreads=[], **kwargs):
 
     do_xe_prebuild = kwargs.pop("do_xe_prebuild", False)
     capfd = kwargs.pop("capfd", None)
@@ -187,15 +280,17 @@ def run_on_simulator_(xe, tester=None, simthreads=[], **kwargs):
 
 
 def run_on_simulator(*args, **kwargs):
-
+    """Build the executable, then run it. Not deprecated: run() does not build."""
     kwargs["do_xe_prebuild"] = True
 
-    result = run_on_simulator_(*args, **kwargs)
+    result = _run_on_simulator(*args, **kwargs)
 
     return result
 
 
 def do_run_pyxsim(xe, simargs, appargs, simthreads, plugins=None):
+    from . import pyxsim
+
     # Get XSI_ENDPOINT environment variable if set, otherwise use local
     xsi_endpoint = os.environ.get("XSI_ENDPOINT")
     if xsi_endpoint:
